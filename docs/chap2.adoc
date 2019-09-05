@@ -1,0 +1,176 @@
+== GraphX基础
+
+本章要点
+
+* GraphX 的基础类
+* 基于Map/Reduce和Pregel的GraphX基础操作
+* 磁盘序列化
+* 常用的图生成工具
+
+=== 顶点对象与边对象
+
+弹性分布式数据集(RDD)是构建Spark程序的基础模块，它提供了灵活、高效、并行化数据处理和容错等特性。在GraphX中，图的基础类为Graph，它包含两个RDD：一个为边RDD，另一个为顶点RDD，如图所示。
+
+与其他图处理系统和图数据库相比，基于图概念和图处理原语的GraphX，它的一大优势在于，既可以将底层数据看作一个完整的图，使用图概念和图处理原语；也可以将它们看作独立的边RDD和顶点RDD，使用数据并行处理原语，进行mapped、joined、transformed等操作。
+
+在GraphX里，没必要(从某些特定顶点开始)“遍历”全图以得到想要的边和顶点。例如，对顶点属性数据进行转换可以一下子完成，而在其他图处理系统和图数据库里，类似的操作就没那么方便了，需要两步：先执行必要的查询，然后再对查询的结果顶点集执行转换操作。
+
+可以用给定的边RDD和顶点RDD构建一个图。一旦构建好图，就可以用函数edges()和vertices()来访问边和顶点的集合。
+
+由于Graph定义的是一个属性图，每一条边和每一个顶点都有用户自定义类表示的属性。
+
+如UML图所表示的，VD和ED表示用户自定义的这些类。对应的图就是参数化类型的泛型类Graph[VD,ED]。例如，当有一个这样的图，顶点用于表示城市和人口数量，顶点间通过道路连接起来，那么就可以用Graph[Long，Double] 来表示这个图，顶点的数据属性是Long类型，表示人口数量，边的数据属性则是Double类型，表示城市间的距离。
+
+即使是Int或String类型，也必须要指定VD和ED的具体类型。这可认为是GraphX的一个小的限制：不支持“缺少属性”的图，即图必须要有顶点和边属性。如果在实际场景中，你的图不需要顶点属性和边属性，可以进行最简单的处理，例如，将Int作为参数的类型，并为每条边和每个顶点设置相同的默认值。
+
+GraphX将VertexId定义为64位的Long类型，实际上在这个问题上也没有其他选择。注意，Edge持有Vertexid值，而不是顶点的引用(即Scala Tuple2二元组(Vertexid,VD))。这是因为图在集群中是分布式存储的，不属于单个 JVM，因此一条边的顶点有可能在集群的不同节点上。
+
+要构建一个图，可以调用这个看起来像构造函数的Graph()。清单4.1中的代码构建了第1章的一个图，在本章其他例子中将继续使用这个图(参见图 4.3)。
+
+[source,scala]
+----
+import org.apache.spark.graphx._
+
+val myVertices = sc.makeRDD(Array((1L, "Ann"), (2L, "Bill"),
+ (3L, "Charles"), (4L, "Diane"), (5L, "Went to gym this morning")))
+
+val myEdges = sc.makeRDD(Array(Edge(1L, 2L, "is-friends-with"),
+ Edge(2L, 3L, "is-friends-with"), Edge(3L, 4L, "is-friends-with"),
+ Edge(4L, 5L, "Likes-status"), Edge(3L, 5L, "Wrote-status")))
+
+val myGraph = Graph(myVertices, myEdges)
+
+myGraph.vertices.collect
+----
+
+[source,scala]
+----
+myGraph.edges.collect
+----
+
+由于普通RDD是无序的，顶点RDD和边RDD也就不能保证有序。
+
+可以使用triplets()方法，根据VertexId将顶点和边联合在一起。Graph本来是将数据分开存储在对应的边RDD和顶点RDD内，triplets()函数只不过是方便地将它们联合在一起。
+
+[source,scala]
+----
+myGraph.triplets.collect
+----
+
+函数triplets()返回EdgeTriplet[VD,ED]类型的RDD，它是Edge[ED]的子类，并包含边的源顶点和目标顶点的引用。如图所示，EdgeTriplet类提供了访问边(以及边属性数据)以及源顶点和目标顶点属性数据的方法。接下来你会看到，GraphX可以便捷地访问边和顶点数据，让图处理任务更简单易用。
+
+下表列出了EdgeTriplet的常用成员属性。
+
+=== mapping操作
+
+GraphX Map/Reduce操作中最有价值的函数是aggregateMessages()。在实际使用这个函数前，首先让我们来看看更简单的mapTriplets()函数，这也会引出GraphX的另一个重要概念。本书中涉及的很多转换操作都会从原来的图生成一个新图。虽然我们也可以自己对边和顶点转换来创建一个新图，这两者的最终结果或许是一致的，但这样就不能利用GraphX提供的底层优化功能了。
+
+==== 简单的图转换
+
+对于在上一小节构建好的图，我们来对每一条满足这两个条件的边增加属性值：1. 属性中包含“is-friends-with”的边：2. 关系的源顶点属性中包含字母a。那么怎么来添加属性呢?参见清单4.4中的代码，将Edge的类型从String转换成二元组(String, Boolean)。EdgeTriplet类正好适合这样的场景，即同时访问边属性和源顶点属性。
+
+[source,scala]
+----
+myGraph.mapTriplets(t => (t.attr, t.attr=="is-friends-with" &&
+ t.srcAttr.toLowerCase.contains("a"))).triplets.collect
+----
+
+结果如下图所示。注意，我们的原始图myGraph(每条边上不存在额外的布尔类型属性)依然存在。而事实上，图中的结果图反而并不是永久存在的，因为我们在调用triplets()后生成的图对象并没有赋值给Scala的val或者var变量。
+
+尽管mapTriplets()有两个可选参数，但这里我们只用了第一个参数。这个参数是一个匿名函数，它传入一个EdgeTriplet对象作为输入参数，返回一个包含二元组(String,Boolean)的Edge类型。
+
+与允许转变Edge类的mapTriplets()类似，函数mapVertices()允许我们直接转变Vertex类。你可以自己探索一下mapVertices()的用法。
+
+==== Map/Reduce
+
+很多图处理任务需要聚集从周围本地邻居顶点发出的消息。这里的邻居指的是顶点周围直接相关联的边和顶点。在第5章会涉及一些如三角形计数的经典图算法，那时会看到如何将来自本地邻居的消息聚集起来的例子。
+
+定义：当一个顶点和另外两个顶点相连，并且另两个顶点也是相连的，就会形成一个三角形。在用于展示朋友关系的社交媒体图中，当其他人是我的朋友，并且他们也相互是朋友时，就会产生三角形。我们可以认为，一个用户涉及的三角形个数，反映了该用户周边社区的连通性。
+
+为了识别一个顶点是否处于三角形中，我们需要考虑与该顶点相连的边集，及这些边除该顶点之外的顶点集，以及这些点之间是否也有相连的边。对于每一个顶点而言，这意味着要考虑它的邻居们的消息。
+
+我们将三角形个数统计的实现放在第5章，这里仅考虑一个简单的例子，重点理解在处理和聚集邻居顶点消息过程中的核心概念。这个思路和经典的Map/Reduce范例(参考第1章)很相似，与Map/Reduce操作一样，我们会定义转换函数(map)用于处理邻居顶点的独立结构；然后，经过转换后的输出结果会被合井，用于更新顶点的消息(reduce)。
+
+我们的例子会统计每个顶点的“出度”一即对于每个顶点而言，离开该顶点的边的条数。为了完成上述操作，我们会间接处理每条边以及与边相关联的源顶点和目标顶点。相比于直接统计从每个顶点出发的边条数，我们会让每条边发出消息到关联的源顶点。这两种方法是等效的。汇总这些消息后，就可以得到我们想要的答案。
+
+清单4.5中的代码使用了aggregateMessages()函数，这也是在GraphX中完成这个任务唯一需要的函数。
+
+[source,scala]
+----
+myGraph.aggregateMessages[Int](_.sendToSrc(1), _ + _).collect
+----
+
+返回的数组里包含了记录顶点ID和顶点出度值的二元组。顶点#4只有一条出边，而顶点#3拥有两条出边。
+
+这是怎么实现的呢?为了理解这段代码的原理，我们将它拆分成几个部分。首先是aggregateMessages的函数签名:
+
+[source,scala]
+----
+def aggregateMessages[Msg](sendMsg: EdgeContext[VD, ED, Msg] => Unit, mergeMsg: (Msg, Msg) => Msg): VertexRDD[Msg]
+----
+
+首先应该注意的是这个函数的参数化类型：Msg(message的缩写，接下来会进行说明)。Msg类型表示函数返回结果数据的类型，我们想要对从顶点传出的边数进行统计，Msg的具体类型选择Int比较合适。
+
+aggregateMessages的两个参数是sendMsg和mergeMsg，提供了转换和聚合的能力。
+
+===== sendMsg
+
+sendMsg函数以EdgeContext作为输入参数，没有返回值。EdgeContext和EdgeTriplet都是参数化类型的类(type-parameterized class)。EdgeContext接口的实现类和EdgeTriplet有两个相同的成员变量，而EdgeContext多提供了两个消息的发送函数。
+
+* sendToSrc：将Msg类型的消息发送给源顶点。
+* sendToDst：将Msg类型的消息发送给目标顶点。
+
+这两个方法是aggregateMessages工作原理的重要组成部分。传递的消息其实就是发送给顶点的一些数据。对于图中的每条边，我们可以选择向源顶点或目标顶点(或同时向这两个顶点)发送消息。在sendMsg方法内部，参数EdgeContext用于检查边、源顶点、目标顶点三者的属性值。在这个例子中，我们需要计算每个顶点发出的边数，所以在边上将包含整数1的消息发送到源顶点。
+
+===== mergeMsg
+
+每个顶点收到的所有消息都会被聚集起来传递给mergeMsg函数。这个函数定义了如何将顶点收到的所有消息转换成我们需要的结果。在示例代码中，我们将所有发给源顶点的数字1累加起来得出边的总数。这就是匿名函数使用+操作完成的。
+
+在每个顶点上应用mergeMsg函数最终返回一个VertexRDD[Int]对象。VertexRDD是一个包含了二元组的RDD，包括了顶点的B以及该顶点的mergeMsg操作的结果。需要注意的一点是，由于顶点的不含有任何出边，它接收不到任何消息，所以它不会出现在结果VertexRDD中。
+
+===== 清理结果
+
+这些原始的Vertexid不容易理解，所以我们为顶点添加上可读的名字。在清单4.6中，我们使用到了Spark RDD的join()操作，这是PairRDDFunctions的一个方法。
+
+[source,scala]
+----
+myGraph.aggregateMessages[Int](_.sendToSrc(1), _ + _).join(myGraph.vertices).collect
+----
+
+当然，上面的做法看起来还是有点烦琐。其实后面用不到这些VertexId了，所以我们可以使用RDD的map()函数去掉它们，可以使用二元组的swap()方法交换两个元素的顺序，将可读的顶点名放在出度值之前使得输出更为美观，如清单4.7所示。
+
+[source,scala]
+----
+myGraph.aggregateMessages[Int](_.sendToSrc(1), _ + _).join(myGraph.vertices).map(_._2.swap).collect
+----
+
+现在进行最后的整理，我们怎么重新获得丢弃的#5顶点呢？可以使用rightOuterJoin()来代替join()，如清单4.8所示。
+
+[source,scala]
+----
+myGraph.aggregateMessages[Int](_.sendToSrc(1), _ + _).rightOuterJoin(myGraph.vertices).map(_._2.swap).collect
+----
+
+啊！新出现的Some和None是怎么回事呢？这是因为当在连接表中不存在相关记录时，外连接会产生值为null或空的字段。这也是Scala为了避免null问题的解决办法(尽管它在你需要的时候依然可以提供null值，并且在和Java代码对接时这常常是不可避免的)。Some和None来自Scala的Option[]类，去掉这些值需要使用Option[]的getOrElse()方法。接下来，为了更好地处理二元组，我们不再简单地使用swap()处理，如清单4.9所示。
+
+[source,scala]
+----
+myGraph.aggregateMessages[Int](_.sendToSrc(1),
+ _ + _).rightOuterJoin(myGraph.vertices).map(
+ x => (x._2._2, x._2._1.getOrElse(0))).collect
+----
+
+Scala小贴士：Scala使用Option[]来代替null，这为函数式编程提供了更好的便利，Option[]可被看作是一个最小集合(包含零个或者一个元素)。函数式编程中的flatmap()函数、for推导式和偏函数等不能处理null，但可以处理Option[]。
+
+==== 迭代的 Map/Reduce
+
+大多数的算法都包含多次迭代。aggregateMessages可用于这类算法，其仅需要基于邻边和顶点发送过来消息来不断更新每个顶点的状态。
+
+为了实现上述过程，我们实现了在图中寻找与顶点距离最远的根顶点的算法。算法的最终结果，我们希望为每个顶点标记上离它最远的根顶点的距离。
+
+假设图不存在环(环表示当沿着边从一个顶点出发，最终又回到同一个顶点)。处理包含环的图通常会增加算法的复杂性，我们稍后会介绍一些处理环的策略。
+
+首先我们对aggregateMessages会调用到的sendMsg和mergeMsg进行定义。我们不把sendMsg和mergeMsg作为匿名函数传给aggregateMessages函数，而是显式地定义sendMsg和mergeMsg函数，这样会使得代码更为清晰。
+
+在函数式编程中实现迭代通常采用递归的方式，所以接下来我们会定义一个用于递归的辅助函数propagateEdgeCount，它会持续调用aggregateMessages(如清单4.10所示)。
+
